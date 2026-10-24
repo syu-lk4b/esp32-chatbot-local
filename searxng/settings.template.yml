@@ -1,0 +1,36 @@
+# Local SearXNG for the voice chat server. Bound to localhost only.
+# install.sh copies this to settings.yml (gitignored) with a random secret_key.
+use_default_settings:
+  engines:
+    keep_only: [bing, bing news, yandex, yahoo, duckduckgo news]
+general:
+  instance_name: "voice-chat-search"
+server:
+  bind_address: "127.0.0.1"
+  port: 8888
+  secret_key: "__GENERATED_BY_INSTALL__"
+  limiter: false
+  image_proxy: false
+search:
+  safe_search: 0
+  default_lang: "zh-CN"
+  formats: [html, json]
+outgoing:
+  request_timeout: 2.0
+  max_request_timeout: 4.0
+# Engines chosen by search-eval/RESULTS.md for this network: web = Bing + Yandex + Yahoo,
+# news = Bing News + DuckDuckGo News (both also merged into general results).
+# Google / Baidu / Brave / Quark / DuckDuckGo web were blocked or CAPTCHA'd; 360 / Sogou empty.
+engines:
+  - name: bing
+    disabled: false
+  - name: yandex
+    disabled: false
+  - name: yahoo
+    disabled: false
+  - name: bing news
+    disabled: false
+    categories: [general, news]
+  - name: duckduckgo news
+    disabled: false
+    categories: [general, news]
