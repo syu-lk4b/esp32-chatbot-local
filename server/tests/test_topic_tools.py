@@ -54,8 +54,21 @@ def test_stock_resolves_symbol_and_formats(hint, symbol, unit):
         return httpx.Response(200, content=QT_US.encode("gbk"))
 
     out = StockQuoteTool(client=client(handler))("英伟达")
-    assert asked[0].endswith(f"q={symbol}")
+    assert asked[0] == f"https://qt.gtimg.cn/q={symbol}"
     assert f"最新价 212.21{unit}" in out and "（-4.40%）" in out and "2026-10-22 16:00:01" in out
+
+
+def test_stock_rejects_malformed_symbol_from_suggest_api():
+    asked = []
+
+    def handler(req):
+        if req.url.host == "smartbox.gtimg.cn":
+            return httpx.Response(200, text='v_hint="sh~600519,sz000001&x=1~x~y~GP"')
+        asked.append(str(req.url))
+        return httpx.Response(200, content=QT_US.encode("gbk"))
+
+    assert StockQuoteTool(client=client(handler))("茅台") == "没有找到：茅台"
+    assert asked == []
 
 
 def test_stock_not_found():

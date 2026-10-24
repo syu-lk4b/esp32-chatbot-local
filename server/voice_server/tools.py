@@ -238,6 +238,8 @@ STOCK_SPEC = {
     },
 }
 _CURRENCY = {"us": "美元", "hk": "港元", "sh": "元", "sz": "元", "bj": "元"}
+# Market prefix + code, e.g. sh600519 / usNVDA. The symbol comes from a remote API and goes into a URL.
+_SYMBOL = re.compile(r"[a-z]{2}[A-Za-z0-9]{1,12}")
 
 
 class StockQuoteTool:
@@ -259,6 +261,9 @@ class StockQuoteTool:
         parts = m.group(1).split("^")[0].split("~")
         market, code, kind = parts[0], parts[1], (parts[4] if len(parts) > 4 else "")
         symbol = f"us{code.split('.')[0].upper()}" if market == "us" else f"{market}{code}"
+        if not _SYMBOL.fullmatch(symbol):
+            log.warning("get_stock_quote: unexpected symbol %r for %r", symbol, query)
+            return self._symbols.put(query, None)
         return self._symbols.put(query, (market, symbol, kind))
 
     def __call__(self, query: str) -> str:
@@ -270,7 +275,7 @@ class StockQuoteTool:
             if not found:
                 return f"没有找到：{query}"
             market, symbol, kind = found
-            r = self._client.get(f"http://qt.gtimg.cn/q={symbol}")
+            r = self._client.get(f"https://qt.gtimg.cn/q={symbol}")
             r.raise_for_status()
             f = r.content.decode("gbk", errors="replace").split("~")
             name, price, prev, chg, pct, ts = f[1], float(f[3]), float(f[4]), float(f[31]), float(f[32]), f[30]
