@@ -6,7 +6,7 @@
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `VOICE_TOKEN` | 安装时随机生成 | 板子请求头 `X-Token` 必须与之相同（固件 `CHAT_TOKEN`） |
+| `VOICE_TOKEN` | 安装时随机生成 | 板子请求头 `X-Token` 必须与之相同（固件 `CHAT_TOKEN`）。为空且监听非本机地址时服务拒绝启动 |
 | `VOICE_HOST` / `VOICE_PORT` | `0.0.0.0` / `8765` | 需对局域网开放，板子才能访问 |
 | `LLM_BACKEND` | `openai` | `openai`：LM Studio 或任意 OpenAI 兼容服务；`ollama`：Ollama 原生接口 |
 | `LLM_URL` | `http://127.0.0.1:1234/v1` | Ollama 用 `http://127.0.0.1:11434` |
