@@ -27,6 +27,9 @@ DEFAULT_SYSTEM_PROMPT = (
 # keeps hitting: a cached prefix answers in ~0.5 s, a changed one costs ~2 s to re-read.
 
 
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
 def _env(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
@@ -35,7 +38,8 @@ def _env(name: str, default: str) -> str:
 class Settings:
     host: str = field(default_factory=lambda: _env("VOICE_HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: int(_env("VOICE_PORT", "8765")))
-    # Shared secret the board sends in X-Token; empty disables the check.
+    # Shared secret the board sends in X-Token. Empty disables the check, which is only
+    # allowed on a loopback bind (see require_safe_exposure).
     token: str = field(default_factory=lambda: _env("VOICE_TOKEN", ""))
 
     # "openai": any OpenAI-compatible server (LM Studio default); "ollama": Ollama's native API.
@@ -71,3 +75,9 @@ class Settings:
     history_turns: int = 8
     session_idle_seconds: float = 600.0
     audio_ttl_seconds: float = 120.0
+
+    def require_safe_exposure(self) -> None:
+        """Refuses to serve the LAN without a token: anyone on the network could drive the LLM."""
+        if not self.token and self.host not in LOOPBACK_HOSTS:
+            raise SystemExit(f"VOICE_TOKEN is empty but VOICE_HOST={self.host} is reachable from the network; "
+                             "set VOICE_TOKEN in server/.env (install.sh generates one) or bind to 127.0.0.1")

@@ -16,6 +16,7 @@ GET  /health
 """
 from __future__ import annotations
 
+import hmac
 import logging
 import time
 import wave
@@ -26,7 +27,7 @@ import numpy as np
 from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from .audio import SILENCE_RMS, float_to_pcm16, pcm16_to_float, rms_int16
@@ -45,8 +46,12 @@ WAKE_ACK_REPLY = "我在呢，你说～"
 WAKE_ACK_EMOTION = "happy"
 
 
+# A spoken question is a sentence or two; this only bounds abuse of the text endpoint.
+MAX_CHAT_TEXT_CHARS = 2000
+
+
 class ChatText(BaseModel):
-    text: str = ""
+    text: str = Field(default="", max_length=MAX_CHAT_TEXT_CHARS)
 
 
 def _ms(timing: dict[str, float]) -> dict[str, int]:
@@ -93,15 +98,24 @@ def create_app(settings: Settings | None = None, engines: dict | None = None) ->
     audio_store = AudioStore(s.audio_ttl_seconds)
 
     def check_token(token: str | None) -> None:
-        if s.token and token != s.token:
+        if s.token and not hmac.compare_digest((token or "").encode(), s.token.encode()):
             raise HTTPException(status_code=401, detail="bad token")
 
+    max_pcm_bytes = int((s.max_record_seconds + 1) * s.sample_rate * 2)
+
     async def read_pcm(request: Request) -> tuple[bytes, float]:
-        pcm = await request.body()
-        seconds = len(pcm) / 2 / s.sample_rate
-        if seconds > s.max_record_seconds + 1:
-            raise HTTPException(status_code=413, detail="recording too long")
-        return pcm, seconds
+        # Reject oversized uploads before buffering them: check the declared length, then cap the stream.
+        too_long = HTTPException(status_code=413, detail="recording too long")
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > max_pcm_bytes:
+            raise too_long
+        buf = bytearray()
+        async for chunk in request.stream():
+            buf += chunk
+            if len(buf) > max_pcm_bytes:
+                raise too_long
+        pcm = bytes(buf)
+        return pcm, len(pcm) / 2 / s.sample_rate
 
     def save_clip(pcm: bytes, tag: str) -> None:
         """Keeps empty-result clips for diagnosis (DEBUG_CLIPS_DIR, newest DEBUG_CLIPS_MAX)."""

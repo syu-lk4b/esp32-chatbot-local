@@ -103,3 +103,32 @@ def test_weather_endpoint(make_client):
         assert c.get("/api/weather", headers={"X-Token": "no"}).status_code == 401
     with make_client("x") as c:  # no weather engine configured
         assert c.get("/api/weather", headers={"X-Token": TOKEN}).status_code == 503
+
+
+def test_oversized_recording_rejected(make_client):
+    too_long = b"\0" * (2 * 16000 * 22)  # 22 s > max_record_seconds + 1
+    with make_client("x") as c:
+        r = c.post("/api/chat", content=too_long, headers={"X-Token": TOKEN})
+        assert r.status_code == 413
+
+
+def test_oversized_recording_rejected_without_content_length(make_client):
+    def chunks():  # chunked upload: no Content-Length, so the stream itself must be capped
+        for _ in range(22):
+            yield b"\0" * (2 * 16000)
+    with make_client("x") as c:
+        r = c.post("/api/transcribe", content=chunks(), headers={"X-Token": TOKEN})
+        assert r.status_code == 413
+
+
+def test_chat_text_length_capped(make_client):
+    with make_client("x") as c:
+        r = c.post("/api/chat_text", json={"text": "长" * 2001}, headers={"X-Token": TOKEN})
+        assert r.status_code == 422
+
+
+def test_lan_bind_requires_token():
+    with pytest.raises(SystemExit, match="VOICE_TOKEN"):
+        Settings(host="0.0.0.0", token="").require_safe_exposure()
+    Settings(host="127.0.0.1", token="").require_safe_exposure()  # loopback-only is fine
+    Settings(host="0.0.0.0", token=TOKEN).require_safe_exposure()
