@@ -108,11 +108,21 @@ size_t readChunk(int16_t* out, uint32_t waitMs) {
   return frames;
 }
 
-bool play(const int16_t* pcm, size_t n, volatile bool* abort, PlayStats* stats) {
+void speakerOn() { digitalWrite(PIN_AMP_EN, LOW); }
+
+void speakerOff() {
+  // Push silence through the DMA ring so the amp doesn't clip the tail.
+  int16_t stereo[CHUNK_FRAMES * 2] = {};
+  size_t written;
+  for (int i = 0; i < 8; i++) i2s_write(I2S_PORT, stereo, sizeof(stereo), &written, portMAX_DELAY);
+  digitalWrite(PIN_AMP_EN, HIGH);
+}
+
+bool play(const int16_t* pcm, size_t n, volatile bool* abort, PlayStats* stats, bool standalone) {
   int16_t stereo[CHUNK_FRAMES * 2];
   size_t written;
   bool completed = true;
-  digitalWrite(PIN_AMP_EN, LOW);
+  if (standalone) speakerOn();
   for (size_t off = 0; off < n; off += CHUNK_FRAMES) {
     if (abort && *abort) {
       completed = false;
@@ -131,10 +141,7 @@ bool play(const int16_t* pcm, size_t n, volatile bool* abort, PlayStats* stats) 
     }
   }
   if (stats) stats->level = 0;
-  // Push silence through the DMA ring so the amp doesn't clip the tail.
-  memset(stereo, 0, sizeof(stereo));
-  for (int i = 0; i < 8; i++) i2s_write(I2S_PORT, stereo, sizeof(stereo), &written, portMAX_DELAY);
-  digitalWrite(PIN_AMP_EN, HIGH);
+  if (standalone) speakerOff();
   return completed;
 }
 

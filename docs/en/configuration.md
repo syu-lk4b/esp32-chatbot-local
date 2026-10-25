@@ -73,6 +73,7 @@ Watch the log with `python3 tools/mon.py 30`, or any serial terminal at 115200, 
 | Command | Action |
 |---|---|
 | `t` | send a 1 s test tone through the full pipeline |
+| `s` | ask for a ~100-character story via `/api/chat_text` (tests multi-sentence playback without speaking) |
 | `m` | toggle HOLD / AUTO |
 | `k` | switch skin |
 | `v` | toggle VAD level / threshold printing |

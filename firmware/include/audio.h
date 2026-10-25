@@ -25,7 +25,14 @@ void flushInput();
 // DMA ring without blocking the UI.
 size_t readChunk(int16_t* out, uint32_t waitMs);
 
-// Plays mono samples; returns early (false) if *abort becomes true.
-bool play(const int16_t* pcm, size_t n, volatile bool* abort = nullptr, PlayStats* stats = nullptr);
+// Plays mono samples; returns early (false) if *abort becomes true. standalone = false
+// leaves the amp alone, for clips played back to back between speakerOn()/speakerOff().
+bool play(const int16_t* pcm, size_t n, volatile bool* abort = nullptr, PlayStats* stats = nullptr,
+          bool standalone = true);
+
+// Amp on / drain the DMA ring and amp off. Keeping the amp on across the sentences of a reply
+// avoids a pop and a gap at every sentence; an underrun meanwhile plays silence (auto-clear).
+void speakerOn();
+void speakerOff();
 
 }  // namespace audio
