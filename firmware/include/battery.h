@@ -1,15 +1,16 @@
 #pragma once
 // LiPo gauge for the ES3C28P: IO9 reads the battery through a 200k/200k divider.
 //
-// The board has no USB-detect pin, so "charging" is inferred from a sustained rise in
-// voltage; it shows up a minute or two after plugging in.
+// The board has no VBUS-detect pin. On a computer, "charging" comes from the native USB
+// seeing a host (immediate); on a plain 5 V charger it is inferred from a sustained rise in
+// voltage and shows up about five minutes after plugging in.
 #include <Arduino.h>
 
 namespace battery {
 
 struct State {
   bool present = false;   // false: no pack, or the power switch is off
-  bool charging = false;  // inferred from the voltage trend
+  bool charging = false;  // USB host attached, or inferred from the voltage trend
   float volts = 0;
   int percent = 0;
 };
