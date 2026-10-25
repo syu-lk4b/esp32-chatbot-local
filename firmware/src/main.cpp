@@ -160,7 +160,7 @@ static int16_t* fetchAudio(const String& path, size_t& n) {
   int status = http.GET();
   int size = http.getSize();
   if (status != HTTP_CODE_OK || size <= 0 || (size_t)size > MAX_REPLY_AUDIO_BYTES) {
-    LOGE("audio GET -> %d size=%d", status, size);
+    LOGE("audio GET -> %d %s size=%d (rssi=%d)", status, HTTPClient::errorToString(status).c_str(), size, WiFi.RSSI());
     http.end();
     return nullptr;
   }
@@ -218,6 +218,7 @@ static bool postForJson(const char* path, const uint8_t* body, size_t len, const
   int status = http.POST(const_cast<uint8_t*>(body), len);
   if (status != HTTP_CODE_OK) {
     http.end();
+    LOGE("POST %s -> %d %s (rssi=%d)", path, status, HTTPClient::errorToString(status).c_str(), WiFi.RSSI());
     setError(status < 0 ? "连不上服务器" : "服务器错误 " + String(status));
     return false;
   }
@@ -912,6 +913,48 @@ void setup() {
   xTaskCreatePinnedToCore(weatherTask, "weather", 8 * 1024, nullptr, 1, nullptr, 0);
 }
 
+// Mesh roaming: at boot the scan sometimes misses the near AP's beacon and joins a far one,
+// and the driver never leaves it; that link drops requests ("连不上服务器"). While idle on a
+// weak link, scan in the background and move to a clearly stronger AP of the same SSID.
+constexpr int ROAM_WEAK_RSSI = -70;
+constexpr int ROAM_MIN_GAIN_DB = 10;
+constexpr uint32_t ROAM_CHECK_MS = 60000;
+constexpr uint32_t ROAM_IDLE_MS = 10000;  // don't scan right after an exchange (follow-ups)
+
+static void maybeRoam(uint32_t now) {
+  static uint32_t lastCheck = 0;
+  static bool scanning = false;
+  if (scanning) {
+    int found = WiFi.scanComplete();
+    if (found == WIFI_SCAN_RUNNING) return;
+    scanning = false;
+    int best = -1, bestRssi = WiFi.RSSI() + ROAM_MIN_GAIN_DB - 1;
+    for (int i = 0; i < found; i++) {
+      if (WiFi.SSID(i) == WIFI_SSID && WiFi.RSSI(i) > bestRssi && WiFi.BSSIDstr(i) != WiFi.BSSIDstr()) {
+        best = i;
+        bestRssi = WiFi.RSSI(i);
+      }
+    }
+    if (best >= 0 && g_phase == Phase::Idle) {
+      Serial.printf("[wifi] roaming %s (%d) -> %s (%d)\n", WiFi.BSSIDstr().c_str(), WiFi.RSSI(),
+                    WiFi.BSSIDstr(best).c_str(), bestRssi);
+      uint8_t bssid[6];
+      memcpy(bssid, WiFi.BSSID(best), sizeof(bssid));
+      int channel = WiFi.channel(best);
+      WiFi.scanDelete();
+      WiFi.begin(WIFI_SSID, WIFI_PASS, channel, bssid);
+      return;
+    }
+    WiFi.scanDelete();
+    return;
+  }
+  if (now - lastCheck < ROAM_CHECK_MS) return;
+  lastCheck = now;
+  if (!WiFi.isConnected() || WiFi.RSSI() >= ROAM_WEAK_RSSI) return;
+  if (g_phase != Phase::Idle || now - g_lastActivity < ROAM_IDLE_MS) return;
+  scanning = WiFi.scanNetworks(true) == WIFI_SCAN_RUNNING;
+}
+
 void loop() {
   static bool touchWasDown = false;
   static uint32_t pressAt = 0;
@@ -954,6 +997,16 @@ void loop() {
           xTaskNotifyGive(g_chatTask);
         }
         break;
+      case 'w': {  // which access points of our SSID the board can hear (blocks ~2 s)
+        int found = WiFi.scanNetworks();
+        Serial.printf("[scan] connected bssid=%s rssi=%d\n", WiFi.BSSIDstr().c_str(), WiFi.RSSI());
+        for (int i = 0; i < found; i++) {
+          if (WiFi.SSID(i) == WIFI_SSID)
+            Serial.printf("[scan] bssid=%s ch=%d rssi=%d\n", WiFi.BSSIDstr(i).c_str(), WiFi.channel(i), WiFi.RSSI(i));
+        }
+        WiFi.scanDelete();
+        break;
+      }
       case 'm': setMode(g_mode == Mode::Auto ? Mode::Hold : Mode::Auto); break;
       case 'v': vadDebug = !vadDebug; break;
       case 'k': nextSkin(); break;
@@ -1060,6 +1113,7 @@ void loop() {
   }
 
   battery::update();
+  maybeRoam(now);
 
   bool wifi = WiFi.isConnected();
   if (wifi != lastWifi) {

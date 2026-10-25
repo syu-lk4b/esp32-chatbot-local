@@ -78,6 +78,7 @@ AUTO 模式的语音检测阈值在 `firmware/include/vad.h`（`START_FLOOR` / `
 | `k` | 切换造型 |
 | `v` | 开关 VAD 音量 / 阈值打印 |
 | `b` | 打印电池电压、百分比、是否充电 |
+| `w` | 扫描并列出广播当前 SSID 的所有 AP |
 | `c` | 截屏（配合 `tools/snap.py`） |
 
 注意：ESP32-S3 原生 USB 下打开串口会复位芯片，发命令前等启动完成（约 8–10 秒，`snap.py --wait 10`）。
