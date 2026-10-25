@@ -78,6 +78,7 @@ Watch the log with `python3 tools/mon.py 30`, or any serial terminal at 115200, 
 | `k` | switch skin |
 | `v` | toggle VAD level / threshold printing |
 | `b` | print battery voltage, percentage, charging state |
+| `w` | scan and list the access points broadcasting the configured SSID |
 | `c` | screenshot (used by `tools/snap.py`) |
 
 Note: on the ESP32-S3's native USB, opening the serial port resets the chip; wait for boot (~8–10 s, `snap.py --wait 10`) before sending commands.
