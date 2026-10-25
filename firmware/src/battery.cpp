@@ -9,9 +9,11 @@ constexpr int SAMPLES = 16;
 constexpr uint32_t SAMPLE_MS = 2000;
 constexpr float SMOOTHING = 0.3f;         // EMA weight of each new reading
 constexpr float PRESENT_MIN_V = 2.5f;     // below this the pack is absent or switched off
-constexpr uint32_t TREND_WINDOW_MS = 60000;
-constexpr float CHARGE_RISE_V = 0.010f;   // rise per window that counts as charging
-constexpr uint32_t CHARGE_HOLD_MS = 150000;
+// TP4054 at ~290 mA lifts a 2000 mAh cell only ~1-3 mV/min, so the window has to be long.
+constexpr uint32_t TREND_WINDOW_MS = 300000;
+constexpr float CHARGE_RISE_V = 0.005f;   // rise per window that counts as charging
+constexpr float DISCHARGE_DROP_V = 0.005f; // fall per window that clears it at once
+constexpr uint32_t CHARGE_HOLD_MS = 360000;
 
 struct Point {
   float v;
@@ -27,6 +29,15 @@ uint32_t g_lastSample = 0;
 uint32_t g_windowStart = 0;
 float g_windowStartV = 0;
 uint32_t g_chargingUntil = 0;
+
+// USB host attached (SOF frames seen) means VBUS is up and the charger is running.
+bool usbHostPlugged() {
+#if ARDUINO_USB_MODE
+  return HWCDC::isPlugged();
+#else
+  return false;
+#endif
+}
 
 float readVolts() {
   uint32_t mv = 0;
@@ -67,11 +78,13 @@ void update() {
   g_state.percent = g_state.present ? percentFor(g_ema) : 0;
 
   if (now - g_windowStart >= TREND_WINDOW_MS) {
-    if (g_state.present && g_ema - g_windowStartV >= CHARGE_RISE_V) g_chargingUntil = now + CHARGE_HOLD_MS;
+    float delta = g_ema - g_windowStartV;
+    if (g_state.present && delta >= CHARGE_RISE_V) g_chargingUntil = now + CHARGE_HOLD_MS;
+    else if (delta <= -DISCHARGE_DROP_V) g_chargingUntil = now;
     g_windowStart = now;
     g_windowStartV = g_ema;
   }
-  g_state.charging = g_state.present && now < g_chargingUntil;
+  g_state.charging = g_state.present && (usbHostPlugged() || now < g_chargingUntil);
 }
 
 State get() { return g_state; }
