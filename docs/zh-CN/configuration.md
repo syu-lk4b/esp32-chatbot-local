@@ -73,6 +73,7 @@ AUTO 模式的语音检测阈值在 `firmware/include/vad.h`（`START_FLOOR` / `
 | 命令 | 作用 |
 |---|---|
 | `t` | 发送 1 秒测试音，走完整链路 |
+| `s` | 通过 `/api/chat_text` 请求一个百字小故事（不用说话即可测试逐句播放） |
 | `m` | 切换 HOLD / AUTO |
 | `k` | 切换造型 |
 | `v` | 开关 VAD 音量 / 阈值打印 |

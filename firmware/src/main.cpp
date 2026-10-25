@@ -116,7 +116,10 @@ static uint32_t g_errorAt = 0;
 static volatile bool g_abortPlayback = false;
 static volatile bool g_resetRequested = false;
 static volatile bool g_warmupRequested = false;
+static volatile bool g_storyRequested = false;  // serial 's': long reply without speaking
 static audio::PlayStats g_play;
+// Share of the reply text covered before / by the chunk now playing, for subtitle scrolling.
+static volatile float g_chunkFrom = 0, g_chunkSpan = 1;
 
 static int16_t* g_rec = nullptr;  // PSRAM recording buffer
 static const size_t REC_CAPACITY = (size_t)(MAX_RECORD_SECONDS * audio::SAMPLE_RATE);
@@ -227,33 +230,128 @@ static bool postForJson(const char* path, const uint8_t* body, size_t len, const
   return true;
 }
 
-// Shows and speaks a chat reply ({user, reply, emotion, audio_url}).
+// Reply speech comes as ordered sentence chunks. While one plays, this task downloads the
+// next ones into a short queue, so sentences follow each other without a download gap.
+// It ends the queue with a null clip (also on a failed download), then deletes itself.
+struct Clip {
+  int16_t* pcm;
+  size_t n;
+};
+constexpr int MAX_REPLY_CHUNKS = 16;
+constexpr int PREFETCH_DEPTH = 2;
+
+struct Prefetch {
+  String urls[MAX_REPLY_CHUNKS];
+  int count = 0;
+  QueueHandle_t queue = nullptr;
+};
+
+static void prefetchTask(void* arg) {
+  auto* job = static_cast<Prefetch*>(arg);
+  for (int i = 0; i < job->count && !g_abortPlayback; i++) {
+    Clip clip{nullptr, 0};
+    clip.pcm = fetchAudio(job->urls[i], clip.n);
+    if (!clip.pcm) break;
+    xQueueSend(job->queue, &clip, portMAX_DELAY);
+  }
+  Clip end{nullptr, 0};
+  xQueueSend(job->queue, &end, portMAX_DELAY);
+  vTaskDelete(nullptr);
+}
+
+// Shows and speaks a chat reply ({user, reply, emotion, audio_urls, audio_chars}; older
+// servers send a single audio_url).
 static void playReply(JsonDocument& doc, uint32_t t0) {
   String user = doc["user"] | "";
   String reply = doc["reply"] | "";
   String emotion = doc["emotion"] | "calm";
-  String audioUrl = doc["audio_url"] | "";
   Serial.printf("[chat] user=%s reply=%s emotion=%s rtt=%lums\n", user.c_str(), reply.c_str(), emotion.c_str(),
                 millis() - t0);
   if (reply.isEmpty()) return;  // hands-free noise: stay quiet
   setExchange(user, reply, emotion);
 
-  size_t n = 0;
-  int16_t* pcm = audioUrl.length() ? fetchAudio(audioUrl, n) : nullptr;
-  if (!pcm) {
+  auto* job = new Prefetch();
+  int chars[MAX_REPLY_CHUNKS] = {};
+  int totalChars = 0;
+  JsonArrayConst urls = doc["audio_urls"];
+  JsonArrayConst sizes = doc["audio_chars"];
+  for (size_t i = 0; i < urls.size() && job->count < MAX_REPLY_CHUNKS; i++) {
+    chars[job->count] = max(1, sizes[i] | 1);
+    totalChars += chars[job->count];
+    job->urls[job->count++] = urls[i] | "";
+  }
+  if (job->count == 0 && (doc["audio_url"] | "")[0]) {
+    job->urls[job->count++] = doc["audio_url"] | "";
+    chars[0] = totalChars = 1;
+  }
+  if (job->count == 0) {
+    delete job;
     setError("语音下载失败");
     return;
   }
-  Serial.printf("[chat] audio %.1fs ready after %lums\n", n / (float)audio::SAMPLE_RATE, millis() - t0);
+
   g_abortPlayback = false;
-  g_play.progress = 0;
-  g_phase = Phase::Speaking;
-  audio::play(pcm, n, &g_abortPlayback, &g_play);
+  job->queue = xQueueCreate(PREFETCH_DEPTH, sizeof(Clip));
+  if (!job->queue || xTaskCreatePinnedToCore(prefetchTask, "prefetch", 12 * 1024, job, 2, nullptr, 0) != pdPASS) {
+    if (job->queue) vQueueDelete(job->queue);
+    delete job;
+    setError("内存不足");
+    return;
+  }
+
+  // Play clips as they arrive; after an abort keep draining (and freeing) until the end marker.
+  int played = 0, doneChars = 0;
+  uint32_t waitedMs = 0;  // time the speaker sat idle waiting for a later chunk's download
+  Clip clip;
+  for (;;) {
+    uint32_t w = millis();
+    if (xQueueReceive(job->queue, &clip, portMAX_DELAY) != pdTRUE || !clip.pcm) break;
+    if (!g_abortPlayback) {
+      if (played == 0) {
+        Serial.printf("[chat] first audio %.1fs ready after %lums (%d chunks)\n", clip.n / (float)audio::SAMPLE_RATE,
+                      millis() - t0, job->count);
+        g_phase = Phase::Speaking;
+        audio::speakerOn();
+      } else {
+        waitedMs += millis() - w;
+      }
+      g_chunkFrom = (float)doneChars / totalChars;
+      g_chunkSpan = (float)chars[played] / totalChars;
+      g_play.progress = 0;
+      audio::play(clip.pcm, clip.n, &g_abortPlayback, &g_play, false);
+    }
+    doneChars += chars[played++];
+    free(clip.pcm);
+  }
+  if (played > 0) audio::speakerOff();
+  if (played > 1) Serial.printf("[chat] %d chunks played, waited %lums for downloads\n", played, waitedMs);
+  vQueueDelete(job->queue);
+  int expected = job->count;
+  delete job;  // the task sent the end marker as its last act, so it no longer touches job
+
+  if (played == 0) {
+    setError("语音下载失败");
+    return;
+  }
+  if (played < expected && !g_abortPlayback) LOGE("reply audio cut short: %d/%d chunks", played, expected);
+  g_chunkFrom = 0;
+  g_chunkSpan = 1;
   g_play.progress = 1;
   g_emotionUntil = millis() + EMOTION_HOLD_MS;
   // In AUTO mode a reply opens a short window where follow-ups need no wake word.
   if (g_mode == Mode::Auto) g_followUntil = millis() + FOLLOW_UP_MS;
-  free(pcm);
+}
+
+static void chatText(const String& text, uint32_t t0) {
+  JsonDocument req;
+  req["text"] = text;
+  String body;
+  serializeJson(req, body);
+  JsonDocument reply;
+  if (postForJson("/api/chat_text", reinterpret_cast<const uint8_t*>(body.c_str()), body.length(),
+                  "application/json", false, reply)) {
+    playReply(reply, t0);
+  }
 }
 
 static void doChat(size_t samples, bool handsFree, bool requireWake) {
@@ -276,15 +374,7 @@ static void doChat(size_t samples, bool handsFree, bool requireWake) {
   Serial.printf("[wake] text=%s woken=%d rtt=%lums\n", (doc["text"] | ""), woken, millis() - t0);
   if (!woken) return;
 
-  JsonDocument req;
-  req["text"] = rest;
-  String body;
-  serializeJson(req, body);
-  JsonDocument reply;
-  if (postForJson("/api/chat_text", reinterpret_cast<const uint8_t*>(body.c_str()), body.length(),
-                  "application/json", false, reply)) {
-    playReply(reply, t0);
-  }
+  chatText(rest, t0);
 }
 
 // The first audio upload after boot takes 2-4 s (later ones ~0.5 s), so push half a
@@ -351,6 +441,9 @@ static void chatTask(void*) {
     if (g_resetRequested) {
       g_resetRequested = false;
       doReset();
+    } else if (g_storyRequested) {
+      g_storyRequested = false;
+      chatText("给我讲一个一百字左右的小故事", millis());
     } else if (WiFi.isConnected()) {
       bool autoMode = g_mode == Mode::Auto;
       // Utterances that began inside the follow-up window skip the wake word.
@@ -705,7 +798,7 @@ static void drawFrame(float micLevel, float recSeconds) {
     canvas.setFont(&fonts::efontCN_16);
     if (you.length()) drawText(ellipsize(you, TEXT_W), SCREEN_W / 2, YOU_Y, phase == Phase::Listening ? C_GREEN : C_SUB, top_center);
     uint16_t aiColor = phase == Phase::Listening ? C_SUB : C_TEXT;
-    drawSubtitle(ai, AI_Y, AI_MAX_LINES, aiColor, phase == Phase::Speaking ? g_play.progress : 0);
+    drawSubtitle(ai, AI_Y, AI_MAX_LINES, aiColor, phase == Phase::Speaking ? g_chunkFrom + g_play.progress * g_chunkSpan : 0);
   }
 
   // Base line
@@ -853,6 +946,13 @@ void loop() {
       case 'c': capture = true; break;
       case 't':
         if (g_phase == Phase::Idle) sendTestTone();
+        break;
+      case 's':  // exercises multi-sentence playback without a microphone
+        if (g_phase == Phase::Idle) {
+          g_storyRequested = true;
+          g_phase = Phase::Thinking;
+          xTaskNotifyGive(g_chatTask);
+        }
         break;
       case 'm': setMode(g_mode == Mode::Auto ? Mode::Hold : Mode::Auto); break;
       case 'v': vadDebug = !vadDebug; break;
