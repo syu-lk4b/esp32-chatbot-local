@@ -1,7 +1,11 @@
 """HTTP API for the ES3C28P voice chat board.
 
 POST /api/chat        body: 16 kHz mono int16 LE PCM. Headers: X-Token, X-Device-Id.
-                      -> REPLY = {"user", "reply", "emotion", "audio_url", "audio_bytes", "tools", "timing_ms"}
+                      -> REPLY = {"user", "reply", "emotion", "audio_url", "audio_bytes", "audio_urls",
+                                  "audio_chars", "tools", "timing_ms"}
+                      Speech comes in sentence chunks, in order: audio_urls[i] speaks audio_chars[i]
+                      characters of the reply. Only the first is synthesized before the reply returns
+                      (audio_url / audio_bytes describe it); the rest are synthesized in the background.
                       X-Hands-Free: 1 -> nothing heard yields an empty reply and no audio,
                       so an always-listening board stays quiet on noise.
                       A leading wake word ("小奇…") is stripped before the LLM sees the text.
@@ -9,7 +13,7 @@ POST /api/transcribe  body: PCM -> {"text", "woken", "rest", "timing_ms"}; ASR o
                       board's wake-word mode to decide cheaply whether it was addressed.
 POST /api/chat_text   body: {"text": str} -> REPLY; empty text means "only the wake word was
                       said" and gets a short acknowledgement.
-GET  /api/audio/{id}  -> reply speech, same PCM format
+GET  /api/audio/{id}  -> reply speech, same PCM format; waits for a chunk still being synthesized
 GET  /api/weather     {city, temp, code, text, icon, min, max} for the board's clock card
 POST /api/reset       clears the device's conversation history
 GET  /health
@@ -20,6 +24,7 @@ import hmac
 import logging
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from contextlib import asynccontextmanager
 
@@ -34,7 +39,8 @@ from .audio import SILENCE_RMS, float_to_pcm16, pcm16_to_float, rms_int16
 from .config import Settings
 from .engines import Asr, Llm, PiperTts, QwenTts
 from .sessions import AudioStore, SessionStore
-from .text import DEFAULT_EMOTION, clean_reply, clean_transcript, split_emotion, split_wake_word, to_speech
+from .text import (DEFAULT_EMOTION, clean_reply, clean_transcript, split_emotion, split_speech, split_wake_word,
+                   to_speech)
 from .tools import (NEWS_SPEC, STOCK_SPEC, WEATHER_SPEC, WEB_SEARCH_SPEC, StockQuoteTool, TechNewsTool,
                     WeatherTool, WebSearch)
 
@@ -45,6 +51,9 @@ NOT_HEARD_REPLY = "我没听清，能再说一遍吗？"
 WAKE_ACK_REPLY = "我在呢，你说～"
 WAKE_ACK_EMOTION = "happy"
 
+
+# How long GET /api/audio waits for a chunk the background synthesizer hasn't finished yet.
+AUDIO_WAIT_SECONDS = 30.0
 
 # A spoken question is a sentence or two; this only bounds abuse of the text endpoint.
 MAX_CHAT_TEXT_CHARS = 2000
@@ -92,10 +101,13 @@ def create_app(settings: Settings | None = None, engines: dict | None = None) ->
         weather()  # warms the geocode + forecast cache for the user's city
         log.info("models ready in %.1fs", time.perf_counter() - t)
         yield
+        tts_worker.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(title="ES3C28P voice chat", lifespan=lifespan)
     sessions = SessionStore(s.history_turns, s.session_idle_seconds)
     audio_store = AudioStore(s.audio_ttl_seconds)
+    # One worker: the TTS model is single-threaded anyway, and chunks must come out in order.
+    tts_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="tts")
 
     def check_token(token: str | None) -> None:
         if s.token and not hmac.compare_digest((token or "").encode(), s.token.encode()):
@@ -146,20 +158,42 @@ def create_app(settings: Settings | None = None, engines: dict | None = None) ->
             save_clip(pcm, f"rms{rms:.0f}-{'gated' if gated else 'empty'}")
         return user
 
-    def speak(text: str, emotion: str, timing: dict[str, float]) -> tuple[str, int]:
+    def synthesize(text: str, emotion: str) -> bytes:
+        return float_to_pcm16(state["tts"].synthesize(to_speech(text), emotion))
+
+    def synthesize_rest(chunks: list[str], keys: list[str], emotion: str) -> None:
+        for i, (chunk, key) in enumerate(zip(chunks, keys)):
+            try:
+                audio_store.fill(key, synthesize(chunk, emotion))
+            except Exception:
+                log.exception("tts failed on chunk %r; dropping the rest of the reply", chunk)
+                for k in keys[i:]:
+                    audio_store.fail(k)
+                return
+
+    def speak(text: str, emotion: str, timing: dict[str, float]) -> tuple[list[str], list[int], int]:
+        """Synthesizes the first chunk now and queues the rest; returns (keys, chars, first chunk bytes)."""
+        chunks = split_speech(text) or [text]
+        keys = [audio_store.reserve() for _ in chunks]
         t = time.perf_counter()
-        pcm = float_to_pcm16(state["tts"].synthesize(to_speech(text), emotion))
+        first = synthesize(chunks[0], emotion)
         timing["tts"] = (time.perf_counter() - t) * 1000
-        return audio_store.put(pcm), len(pcm)
+        audio_store.fill(keys[0], first)
+        if len(chunks) > 1:
+            tts_worker.submit(synthesize_rest, chunks[1:], keys[1:], emotion)
+        return keys, [len(c) for c in chunks], len(first)
 
     def reply_payload(user: str, reply: str, emotion: str, tools: list[str], timing: dict[str, float]) -> dict:
-        audio_id, n_bytes = speak(reply, emotion, timing)
+        keys, chars, first_bytes = speak(reply, emotion, timing)
+        urls = [f"/api/audio/{k}" for k in keys]
         return {
             "user": user,
             "reply": reply,
             "emotion": emotion,
-            "audio_url": f"/api/audio/{audio_id}",
-            "audio_bytes": n_bytes,
+            "audio_url": urls[0],
+            "audio_bytes": first_bytes,
+            "audio_urls": urls,
+            "audio_chars": chars,
             "tools": tools,
             "timing_ms": _ms(timing),
         }
@@ -181,7 +215,7 @@ def create_app(settings: Settings | None = None, engines: dict | None = None) ->
 
     def quiet(timing: dict[str, float]) -> dict:
         return {"user": "", "reply": "", "emotion": DEFAULT_EMOTION, "audio_url": "", "audio_bytes": 0,
-                "tools": [], "timing_ms": _ms(timing)}
+                "audio_urls": [], "audio_chars": [], "tools": [], "timing_ms": _ms(timing)}
 
     @app.get("/health")
     def health() -> dict:
@@ -252,7 +286,7 @@ def create_app(settings: Settings | None = None, engines: dict | None = None) ->
     @app.get("/api/audio/{audio_id}")
     def audio(audio_id: str, x_token: str | None = Header(default=None)) -> Response:
         check_token(x_token)
-        pcm = audio_store.get(audio_id)
+        pcm = audio_store.get(audio_id, AUDIO_WAIT_SECONDS)
         if pcm is None:
             raise HTTPException(status_code=404, detail="audio expired")
         return Response(content=pcm, media_type="application/octet-stream")

@@ -49,10 +49,10 @@ sequenceDiagram
   participant S as voice_server
   U->>B: 按住屏幕说话，松开
   B->>S: POST /api/chat (PCM)
-  S->>S: Whisper → LLM(+搜索) → 情绪 → TTS
-  S-->>B: {user, reply, emotion, audio_url}
-  B->>S: GET /api/audio/{id}
-  S-->>B: 16 kHz PCM
+  S->>S: Whisper → LLM(+搜索) → 情绪 → TTS（仅第一句）
+  S-->>B: {user, reply, emotion, audio_urls}
+  B->>S: GET /api/audio/{id} × N
+  S-->>B: 16 kHz PCM（逐句，其余在后台继续合成）
   B->>U: 表情 + 字幕 + 播放
 ```
 
@@ -69,7 +69,7 @@ sequenceDiagram
   S-->>B: {woken: true, rest: "明天下雨吗"}
   Note over B: 被叫到了 → 思考表情
   B->>S: POST /api/chat_text {"text": rest}
-  S-->>B: 回答 + 情绪 + audio_url
+  S-->>B: 回答 + 情绪 + audio_urls
   B->>S: GET /api/audio/{id}
   B->>U: 播放；之后 8 秒内追问无需唤醒词（走 /api/chat）
 ```
@@ -82,15 +82,17 @@ sequenceDiagram
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| POST | `/api/chat` | 16 kHz mono int16 LE PCM；可选 `X-Hands-Free: 1`（没听清时返回空回复，保持安静） | `{user, reply, emotion, audio_url, audio_bytes, tools, timing_ms}`；开头的唤醒词会先剥掉 |
+| POST | `/api/chat` | 16 kHz mono int16 LE PCM；可选 `X-Hands-Free: 1`（没听清时返回空回复，保持安静） | `{user, reply, emotion, audio_url, audio_bytes, audio_urls, audio_chars, tools, timing_ms}`；开头的唤醒词会先剥掉 |
 | POST | `/api/transcribe` | PCM | `{text, woken, rest, timing_ms}` |
 | POST | `/api/chat_text` | `{"text": "..."}`；空字符串 = 只喊了唤醒词 | 同 `/api/chat`；空文本回「我在呢，你说～」 |
-| GET | `/api/audio/{id}` | — | 回复语音 PCM（2 分钟内有效） |
+| GET | `/api/audio/{id}` | — | 回复语音 PCM（2 分钟内有效；还没合成好的句子会等它合成完） |
 | GET | `/api/weather` | — | `{city, temp, code, text, icon, min, max}`，供板子的时间天气卡片使用（与 `get_weather` 共用缓存） |
 | POST | `/api/reset` | — | 清空该设备的对话记忆 |
 | GET | `/health` | — | `{ok, llm}` |
 
 ## 关键设计
+
+- **逐句语音**：回复按句切块（`split_speech`，第一块尽量短，必要时在逗号处切开），服务端只合成第一块就返回，其余块在后台按顺序合成；`/api/audio/{id}` 遇到还没合成好的块会等待。板子播放第 i 块时由预取任务下载第 i+1 块，所以开口延迟只取决于第一句，和回复长短无关。
 
 - **情绪标签**：系统提示词要求回答以 `[happy]` 等标签开头；服务端拆出 `emotion` 字段，板子据此选表情，TTS 据此选语气（`EMOTION_INSTRUCT`）。
 - **唤醒词识别**：在 Whisper 文本上做，接受常见同音写法（小琪 / 小齐 / 小七…）；只叫一遍「小奇」时后面必须停顿，避免「小奇怪」误触发。
