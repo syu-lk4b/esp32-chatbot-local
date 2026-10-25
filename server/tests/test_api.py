@@ -52,6 +52,34 @@ def test_chat_returns_reply_and_fetchable_audio(make_client):
         assert audio.status_code == 200 and len(audio.content) == r["audio_bytes"] == 3200
 
 
+def test_long_reply_is_spoken_in_ordered_chunks(make_client):
+    long_text = "今天天气不错，阳光很好。下午可能有阵雨，出门记得带伞。晚上降温，注意加衣服哦。"
+    with make_client(long_text) as c:
+        r = post(c, SPEECH).json()
+        assert len(r["audio_urls"]) > 1 and r["audio_urls"][0] == r["audio_url"]
+        assert sum(r["audio_chars"]) == len(r["reply"])
+        for url in r["audio_urls"]:  # later chunks are waited for, not 404
+            audio = c.get(url, headers={"X-Token": TOKEN})
+            assert audio.status_code == 200 and len(audio.content) == 3200
+
+
+def test_tts_failure_on_later_chunk_expires_its_audio():
+    class FailingTts(FakeTts):
+        calls = 0
+
+        def synthesize(self, text, emotion=None):
+            FailingTts.calls += 1
+            if FailingTts.calls > 1:
+                raise RuntimeError("boom")
+            return super().synthesize(text, emotion)
+
+    engines = {"asr": FakeAsr("第一句话说得比较长一点。第二句话也说得比较长一点。"), "llm": FakeLlm(), "tts": FailingTts()}
+    with TestClient(create_app(Settings(token=TOKEN, debug_clips_dir=""), engines=engines)) as c:
+        r = post(c, SPEECH).json()
+        assert c.get(r["audio_urls"][0], headers={"X-Token": TOKEN}).status_code == 200
+        assert c.get(r["audio_urls"][1], headers={"X-Token": TOKEN}).status_code == 404
+
+
 def test_hold_mode_says_not_heard_on_silence(make_client):
     with make_client("") as c:
         r = post(c, SILENCE).json()

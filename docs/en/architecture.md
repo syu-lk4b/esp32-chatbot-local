@@ -49,10 +49,10 @@ sequenceDiagram
   participant S as voice_server
   U->>B: hold the screen, speak, release
   B->>S: POST /api/chat (PCM)
-  S->>S: Whisper → LLM (+tools) → emotion → TTS
-  S-->>B: {user, reply, emotion, audio_url}
-  B->>S: GET /api/audio/{id}
-  S-->>B: 16 kHz PCM
+  S->>S: Whisper → LLM (+tools) → emotion → TTS (first sentence only)
+  S-->>B: {user, reply, emotion, audio_urls}
+  B->>S: GET /api/audio/{id} × N
+  S-->>B: 16 kHz PCM (one sentence each, rest synthesized in the background)
   B->>U: face + caption + playback
 ```
 
@@ -69,7 +69,7 @@ sequenceDiagram
   S-->>B: {woken: true, rest: "明天下雨吗"}
   Note over B: called by name → thinking face
   B->>S: POST /api/chat_text {"text": rest}
-  S-->>B: reply + emotion + audio_url
+  S-->>B: reply + emotion + audio_urls
   B->>S: GET /api/audio/{id}
   B->>U: play, then follow-ups within 8 s need no wake word (via /api/chat)
 ```
@@ -82,15 +82,17 @@ Every request carries `X-Token` (= `VOICE_TOKEN`) and `X-Device-Id` (the board s
 
 | Method | Path | Request | Response |
 |---|---|---|---|
-| POST | `/api/chat` | 16 kHz mono int16 LE PCM; optional `X-Hands-Free: 1` (returns an empty reply when nothing intelligible was heard, so the board stays quiet) | `{user, reply, emotion, audio_url, audio_bytes, tools, timing_ms}`; a leading wake word is stripped |
+| POST | `/api/chat` | 16 kHz mono int16 LE PCM; optional `X-Hands-Free: 1` (returns an empty reply when nothing intelligible was heard, so the board stays quiet) | `{user, reply, emotion, audio_url, audio_bytes, audio_urls, audio_chars, tools, timing_ms}`; a leading wake word is stripped |
 | POST | `/api/transcribe` | PCM | `{text, woken, rest, timing_ms}` |
 | POST | `/api/chat_text` | `{"text": "..."}`; empty string = wake word only | same as `/api/chat`; empty text gets "我在呢，你说～" ("I'm here, go ahead") |
-| GET | `/api/audio/{id}` | — | reply audio as PCM (valid for 2 min) |
+| GET | `/api/audio/{id}` | — | reply audio as PCM (valid for 2 min; waits for a sentence still being synthesized) |
 | GET | `/api/weather` | — | `{city, temp, code, text, icon, min, max}` for the clock/weather card (shares the `get_weather` cache) |
 | POST | `/api/reset` | — | clear this device's conversation memory |
 | GET | `/health` | — | `{ok, llm}` |
 
 ## Design notes
+
+- **Sentence-by-sentence speech**: the reply is split into chunks (`split_speech`; the first is kept short, cut at a comma if needed). The server synthesizes only the first before answering and the rest in the background, in order; `/api/audio/{id}` waits for a chunk that isn't ready yet. The board downloads chunk i+1 while chunk i plays, so time-to-first-sound depends on the first sentence, not the reply length.
 
 - **Emotion tags**: the system prompt asks for a tag such as `[happy]` at the start of every reply; the server splits it into `emotion`. The board picks the face from it and TTS picks the delivery (`EMOTION_INSTRUCT`).
 - **Wake word**: matched on Whisper's text, accepting common homophones (小琪 / 小齐 / 小七…). A single "小奇" must be followed by a pause, so words like "小奇怪" don't trigger it.

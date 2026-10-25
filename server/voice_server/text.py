@@ -116,3 +116,42 @@ def split_wake_word(text: str) -> tuple[bool, str]:
     if not m:
         return False, text.strip()
     return True, _LEADING_PUNCT.sub("", text[m.end():]).strip()
+
+
+# Speech is synthesized and played sentence by sentence, so the board starts talking after
+# the first chunk instead of the whole reply. Chunks end on sentence boundaries so each keeps
+# its natural intonation; only an overlong first sentence is cut at a comma, since the first
+# chunk alone sets the latency. Later ones merge short sentences for smoother
+# prosody but stay small enough that, on a slow link, each downloads before the previous one
+# finishes playing; tiny fragments ride along with their neighbour.
+_SENTENCE = re.compile(r"[^。！？!?；;…]+[。！？!?；;…]*|[。！？!?；;…]+")
+_CLAUSE_BREAK = re.compile(r"[，,、：:]")
+FIRST_CHUNK_MAX_CHARS = 30
+CHUNK_MAX_CHARS = 30
+CHUNK_MIN_CHARS = 8
+
+
+def split_speech(text: str) -> list[str]:
+    """Splits a reply into consecutive chunks whose concatenation is the original text."""
+    sentences = [s for s in _SENTENCE.findall(text) if s.strip()]
+    if not sentences:
+        return [text] if text.strip() else []
+    chunks: list[str] = []
+    for s in sentences:
+        if not chunks:
+            chunks.append(s)
+        elif len(chunks[-1]) < CHUNK_MIN_CHARS or (
+                len(chunks) > 1 and len(chunks[-1]) + len(s) <= CHUNK_MAX_CHARS):
+            chunks[-1] += s
+        else:
+            chunks.append(s)
+    if len(chunks) > 1 and len(chunks[-1].strip()) < CHUNK_MIN_CHARS:
+        chunks[-2] += chunks.pop()
+
+    first = chunks[0]
+    if len(first) > FIRST_CHUNK_MAX_CHARS:
+        cuts = [m.end() for m in _CLAUSE_BREAK.finditer(first, CHUNK_MIN_CHARS)
+                if m.end() <= FIRST_CHUNK_MAX_CHARS and len(first) - m.end() >= CHUNK_MIN_CHARS]
+        if cuts:
+            chunks[:1] = [first[:cuts[-1]], first[cuts[-1]:]]
+    return chunks

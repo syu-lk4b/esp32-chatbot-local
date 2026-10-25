@@ -1,9 +1,11 @@
+import threading
 import numpy as np
 import pytest
 
 from voice_server.audio import float_to_pcm16, normalize, pcm16_to_float, resample, rms_int16
 from voice_server.sessions import AudioStore, SessionStore
-from voice_server.text import clean_reply, clean_transcript, split_emotion, split_wake_word, to_speech
+from voice_server.text import (FIRST_CHUNK_MAX_CHARS, clean_reply, clean_transcript, split_emotion, split_speech,
+                               split_wake_word, to_speech)
 
 
 class FakeClock:
@@ -70,6 +72,37 @@ def test_audio_store_ttl():
     clock.t = 6
     assert store.get(key) is None
     assert store.get("missing") is None
+
+
+def test_audio_store_pending_until_filled_or_failed():
+    store = AudioStore(ttl_seconds=5)
+    key = store.reserve()
+    assert store.get(key, wait_seconds=0.01) is None
+    threading.Timer(0.05, store.fill, (key, b"pcm")).start()
+    assert store.get(key, wait_seconds=2) == b"pcm"
+    bad = store.reserve()
+    store.fail(bad)
+    assert store.get(bad, wait_seconds=2) is None
+
+
+@pytest.mark.parametrize("text", [
+    "上海现在晴，二十一度，挺舒服的。不过今天有毛毛雨，降水概率很高，出门记得带伞哦，气温十七到二十三度。",
+    "嗯？你刚才好像只发了一个符号，我没听清呢，能再说一遍吗？",
+    "好的。今天天气不错！要不要出去走走？顺便买点水果吧。还有记得喝水。",
+    "股价12.5元，涨了3.2%。",
+    "没有任何标点的一长段话会原样作为一个块整体合成出来不会被切开",
+    "你好呀！",
+])
+def test_split_speech_keeps_text_and_short_first_chunk(text):
+    chunks = split_speech(text)
+    assert "".join(chunks) == text
+    assert all(c.strip() for c in chunks)
+    if len(chunks) > 1:
+        assert len(chunks[0]) <= FIRST_CHUNK_MAX_CHARS
+
+
+def test_split_speech_empty():
+    assert split_speech("") == [] and split_speech("  ") == []
 
 
 @pytest.mark.parametrize(

@@ -44,26 +44,57 @@ class SessionStore:
             self._sessions.pop(device_id, None)
 
 
+@dataclass
+class _Clip:
+    created: float
+    ready: threading.Event = field(default_factory=threading.Event)
+    pcm: bytes | None = None  # None while pending, or if synthesis failed
+
+
 class AudioStore:
-    """Holds synthesized replies until the board fetches them."""
+    """Holds synthesized replies until the board fetches them.
+
+    A key can be reserved before its audio exists (later sentences of a reply are still being
+    synthesized); get() then waits for fill() or fail().
+    """
 
     def __init__(self, ttl_seconds: float, clock=time.monotonic) -> None:
         self._ttl = ttl_seconds
         self._clock = clock
-        self._items: dict[str, tuple[float, bytes]] = {}
+        self._items: dict[str, _Clip] = {}
         self._lock = threading.Lock()
 
-    def put(self, pcm: bytes) -> str:
+    def reserve(self) -> str:
         key = secrets.token_urlsafe(12)
         with self._lock:
             now = self._clock()
-            self._items = {k: v for k, v in self._items.items() if now - v[0] <= self._ttl}
-            self._items[key] = (now, pcm)
+            self._items = {k: v for k, v in self._items.items() if now - v.created <= self._ttl}
+            self._items[key] = _Clip(now)
         return key
 
-    def get(self, key: str) -> bytes | None:
+    def fill(self, key: str, pcm: bytes) -> None:
+        self._finish(key, pcm)
+
+    def fail(self, key: str) -> None:
+        self._finish(key, None)
+
+    def _finish(self, key: str, pcm: bytes | None) -> None:
         with self._lock:
-            item = self._items.get(key)
-            if item is None or self._clock() - item[0] > self._ttl:
+            clip = self._items.get(key)
+        if clip is not None:
+            clip.pcm = pcm
+            clip.ready.set()
+
+    def put(self, pcm: bytes) -> str:
+        key = self.reserve()
+        self.fill(key, pcm)
+        return key
+
+    def get(self, key: str, wait_seconds: float = 0.0) -> bytes | None:
+        """The audio, or None if unknown, expired, failed, or still pending after wait_seconds."""
+        with self._lock:
+            clip = self._items.get(key)
+            if clip is None or self._clock() - clip.created > self._ttl:
                 return None
-            return item[1]
+        clip.ready.wait(wait_seconds)
+        return clip.pcm
